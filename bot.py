@@ -203,23 +203,26 @@ async def search_kiwi(from_code, to_code, date_from, date_to, passengers, max_st
     return []
 
 
-async def search_aviasales(from_code, to_code, date_from, passengers) -> list:
+async def search_aviasales(from_code, to_code, date_from, date_to, passengers, max_stops) -> list:
     """Поиск через Aviasales/Travelpayouts (кэшированные дешёвые цены)."""
     url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+
+    # Парсим диапазон дат пользователя
     try:
-        month = datetime.strptime(date_from, "%d.%m.%Y").strftime("%Y-%m")
+        dt_from = datetime.strptime(date_from, "%d.%m.%Y")
+        dt_to   = datetime.strptime(date_to,   "%d.%m.%Y")
     except Exception:
-        month = date_from[:7]
+        dt_from = dt_to = None
 
     params = {
         "origin": from_code,
         "destination": to_code,
-        "departure_at": month,
+        "departure_at": dt_from.strftime("%Y-%m") if dt_from else date_from[:7],
         "unique": "false",
         "sorting": "price",
-        "direct": "false",
+        "direct": "true" if max_stops == 0 else "false",
         "currency": "rub",
-        "limit": 5,
+        "limit": 20,          # берём больше чтобы было из чего фильтровать
         "one_way": "true",
         "token": AVIASALES_TOKEN,
     }
@@ -230,22 +233,35 @@ async def search_aviasales(from_code, to_code, date_from, passengers) -> list:
                 if r.status == 200:
                     data = await r.json()
                     results = []
-                    for f in data.get("data", [])[:4]:
+                    for f in data.get("data", []):
                         dep_raw = f.get("departure_at", "")
+                        stops   = f.get("transfers", 0)
+                        price   = int(f.get("price", 0))
+
+                        # Фильтр по количеству пересадок
+                        if stops > max_stops:
+                            continue
+
+                        # Фильтр по датам — только в диапазоне пользователя
+                        if dt_from and dt_to:
+                            try:
+                                dep_dt = datetime.fromisoformat(dep_raw[:10])
+                                if not (dt_from <= dep_dt <= dt_to):
+                                    continue
+                            except Exception:
+                                pass
+
                         try:
                             dep = datetime.fromisoformat(dep_raw.rstrip("Z")).strftime("%d.%m %H:%M")
                         except Exception:
                             dep = dep_raw[:10]
 
                         airline = f.get("airline", "")
-                        fnum = f.get("flight_number", "")
-                        stops = f.get("transfers", 0)
-                        price = int(f.get("price", 0))
-
+                        fnum    = f.get("flight_number", "")
                         dep_date = dep_raw[:10].replace("-", "")
                         link = (
                             f"https://www.aviasales.ru/search/"
-                            f"{from_code}{dep_date}{to_code}1"
+                            f"{from_code}{dep_date}{to_code}{passengers}"
                         )
 
                         results.append({
@@ -258,6 +274,8 @@ async def search_aviasales(from_code, to_code, date_from, passengers) -> list:
                             "arr": "—",
                             "link": link,
                         })
+                        if len(results) >= 4:
+                            break
                     return results
     except Exception as e:
         logger.error(f"Aviasales search error: {e}")
@@ -279,7 +297,7 @@ def trip_link(from_code, to_code, date_from, passengers) -> str:
 async def search_all(from_code, to_code, date_from, date_to, passengers, max_stops) -> list:
     """Запускает поиск во всех источниках параллельно."""
     kiwi_task = search_kiwi(from_code, to_code, date_from, date_to, passengers, max_stops)
-    avia_task = search_aviasales(from_code, to_code, date_from, passengers)
+    avia_task = search_aviasales(from_code, to_code, date_from, date_to, passengers, max_stops)
 
     kiwi_res, avia_res = await asyncio.gather(kiwi_task, avia_task, return_exceptions=True)
 
