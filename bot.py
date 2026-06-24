@@ -763,6 +763,24 @@ async def monitor_prices(app: Application):
 # ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def on_startup(app):
+    """Запускается при старте PTB — инициализируем БД и планировщик."""
+    await db_init()
+    logger.info("✈️ БД инициализирована")
+
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        monitor_prices,
+        trigger="interval",
+        hours=CHECK_INTERVAL_HOURS,
+        args=[app],
+        id="price_monitor",
+        next_run_time=None,
+    )
+    scheduler.start()
+    logger.info("✈️ Планировщик запущен")
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан в .env")
@@ -771,10 +789,7 @@ def main():
     if not AVIASALES_TOKEN:
         logger.warning("AVIASALES_TOKEN не задан — поиск Aviasales не будет работать")
 
-    # Инициализация БД
-    asyncio.run(db_init())
-
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     # ── ConversationHandler для пошагового поиска ────────────────────────────
     conv = ConversationHandler(
@@ -811,18 +826,6 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(cb_subscribe,   pattern="^DO_SUBSCRIBE$"))
     app.add_handler(CallbackQueryHandler(cb_unsubscribe, pattern=r"^UNSUB_\d+$"))
-
-    # ── Планировщик мониторинга ───────────────────────────────────────────────
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(
-        monitor_prices,
-        trigger="interval",
-        hours=CHECK_INTERVAL_HOURS,
-        args=[app],
-        id="price_monitor",
-        next_run_time=None,  # не запускать сразу при старте
-    )
-    scheduler.start()
 
     logger.info("✈️ Бот запущен!")
     app.run_polling(drop_pending_updates=True)
