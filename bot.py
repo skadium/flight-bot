@@ -112,32 +112,31 @@ async def db_deactivate(sub_id, user_id):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def find_location(query: str) -> list:
-    """Ищет аэропорт/город через Kiwi API, возвращает список вариантов."""
-    url = "https://tequila.kiwi.com/locations/query"
+    """Ищет аэропорт/город через Travelpayouts autocomplete (бесплатно, без ключа)."""
+    url = "https://autocomplete.travelpayouts.com/places2"
     params = {
         "term": query,
-        "locale": "ru-RU",
-        "location_types": "airport,city",
-        "limit": 5,
-        "active_only": True,
+        "locale": "ru",
+        "types[]": ["city", "airport"],
     }
-    headers = {"apikey": KIWI_API_KEY}
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, params=params, headers=headers,
+            async with s.get(url, params=params,
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
-                    data = await r.json()
+                    data = await r.json(content_type=None)
                     results = []
-                    for loc in data.get("locations", []):
-                        city = (loc.get("city") or {}).get("name", "")
-                        country = (loc.get("country") or {}).get("name", "")
-                        name = city or loc.get("name", loc["code"])
+                    for loc in data[:5]:
+                        code = loc.get("code", "")
+                        name = loc.get("name", code)
+                        country = loc.get("country_name", "")
+                        if not code:
+                            continue
                         results.append({
-                            "code": loc["code"],
+                            "code": code,
                             "name": name,
                             "country": country,
-                            "label": f"{name} ({loc['code']}) — {country}",
+                            "label": f"{name} ({code}) — {country}",
                         })
                     return results
     except Exception as e:
