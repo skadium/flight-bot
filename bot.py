@@ -333,6 +333,29 @@ def route_score(price: int, stops: int, layover_hours: float = 0) -> float:
     return price + stop_penalty + layover_penalty
 
 
+def layover_warnings(dep_str: str, next_dep_str: str, layover_h: float) -> list[str]:
+    """Возвращает список предупреждений о пересадке."""
+    warnings = []
+    if layover_h >= 6:
+        warnings.append(f"🐢 Долгая пересадка ({layover_h:.0f}ч)")
+    # Ночная пересадка: если транзит захватывает 23:00–05:00
+    try:
+        fmt = "%d.%m %H:%M"
+        t1 = datetime.strptime(dep_str, fmt)
+        t2 = datetime.strptime(next_dep_str, fmt)
+        # Проверяем каждый час транзита
+        from datetime import timedelta
+        cur = t1
+        while cur < t2:
+            if cur.hour >= 23 or cur.hour < 5:
+                warnings.append("🌙 Ночная пересадка")
+                break
+            cur += timedelta(hours=1)
+    except Exception:
+        pass
+    return warnings
+
+
 async def search_via_hub(from_code, hub_code, hub_name, to_code,
                          date_from, date_to, passengers) -> dict | None:
     """Строит маршрут A → HUB → B, считает суммарную стоимость и оценку."""
@@ -344,11 +367,11 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
     if not (isinstance(leg1, list) and leg1 and isinstance(leg2, list) and leg2):
         return None
 
-    l1, l2   = leg1[0], leg2[0]
-    total    = l1["price"] + l2["price"]
-    stops    = l1["stops"] + l2["stops"] + 1  # +1 за пересадку в хабе
+    l1, l2 = leg1[0], leg2[0]
+    total   = l1["price"] + l2["price"]
+    stops   = l1["stops"] + l2["stops"] + 1
 
-    # Оцениваем время транзита в хабе по разнице дат вылета
+    # Время транзита в хабе
     layover_h = 0.0
     try:
         fmt = "%d.%m %H:%M"
@@ -357,6 +380,8 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
         layover_h = max(0, (t2 - t1).total_seconds() / 3600)
     except Exception:
         pass
+
+    warnings = layover_warnings(l1["dep"], l2["dep"], layover_h)
 
     return {
         "source"    : "Aviasales",
@@ -374,6 +399,7 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
         "leg1_price": l1["price"],
         "leg2_price": l2["price"],
         "layover_h" : layover_h,
+        "warnings"  : warnings,
         "score"     : route_score(total, stops, layover_h),
     }
 
@@ -478,10 +504,17 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
             text += f"   {fmt_stops(f['stops'], hub)}\n"
             lh = f.get("layover_h", 0)
             if lh > 0:
-                text += f"   ⏱ Транзит в {hub}: ~{lh:.0f}ч\n"
-            l1 = fmt_price(f.get("leg1_price", 0))
-            l2 = fmt_price(f.get("leg2_price", 0))
-            text += f"   💰 {l1} + {l2}\n"
+                text += f"   ⏱ Пересадка в {hub}: ~{lh:.0f}ч\n"
+            # Предупреждения
+            for w in f.get("warnings", []):
+                text += f"   {w}\n"
+            # Общее время (приблизительно по разнице вылетов)
+            if lh > 0:
+                approx_total = lh + 3  # +3ч на среднее время перелётов
+                text += f"   🕰 Время в пути: ~{approx_total:.0f}ч (примерно)\n"
+            l1p = fmt_price(f.get("leg1_price", 0))
+            l2p = fmt_price(f.get("leg2_price", 0))
+            text += f"   💰 {l1p} + {l2p}\n"
             text += f"   🔗 [Плечо 1 →]({f['link']})  [Плечо 2 →]({f.get('link2', f['link'])})\n\n"
         else:
             text += f"   ✈️ {f['airlines']}\n"
