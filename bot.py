@@ -3,7 +3,8 @@ import asyncio
 import logging
 import aiohttp
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, date as _date, timedelta as _td
+from calendar import monthcalendar as _monthcal
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -384,6 +385,164 @@ SMART_HUBS = [
     ("KUL", "Куала-Лумпур"),
 ]
 
+# ─── Инлайн-календарь ────────────────────────────────────────────────────────
+_MONTH_RU = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+             "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+
+
+def build_calendar(year: int, month: int, prefix: str) -> InlineKeyboardMarkup:
+    """Строит клавиатуру-календарь. prefix: 'cf' (from) или 'ct' (to)."""
+    today = _date.today()
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Быстрые кнопки
+    quick = []
+    for label, delta in [("Завтра", 1), ("+7д", 7), ("+14д", 14), ("+30д", 30)]:
+        d = today + _td(days=delta)
+        quick.append(InlineKeyboardButton(label, callback_data=f"{prefix}_q:{d.isoformat()}"))
+    rows.append(quick)
+
+    # Навигация: ← Месяц Год →
+    prev_m, prev_y = (month - 1, year) if month > 1 else (12, year - 1)
+    next_m, next_y = (month + 1, year) if month < 12 else (1, year + 1)
+    rows.append([
+        InlineKeyboardButton("◀", callback_data=f"{prefix}_n:{prev_y}:{prev_m}"),
+        InlineKeyboardButton(f"{_MONTH_RU[month]} {year}", callback_data="ign"),
+        InlineKeyboardButton("▶", callback_data=f"{prefix}_n:{next_y}:{next_m}"),
+    ])
+
+    # Заголовок дней
+    rows.append([InlineKeyboardButton(d, callback_data="ign")
+                 for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]])
+
+    # Числа месяца
+    for week in _monthcal(year, month):
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="ign"))
+            else:
+                d = _date(year, month, day)
+                if d < today:
+                    row.append(InlineKeyboardButton("·", callback_data="ign"))
+                else:
+                    row.append(InlineKeyboardButton(
+                        str(day), callback_data=f"{prefix}_d:{d.isoformat()}"))
+        rows.append(row)
+
+    return InlineKeyboardMarkup(rows)
+
+
+def _iso_to_display(iso: str) -> str:
+    """2026-07-01 → 01.07.2026"""
+    try:
+        return _date.fromisoformat(iso).strftime("%d.%m.%Y")
+    except Exception:
+        return iso
+
+
+async def _show_cal_from(target, ctx, year=None, month=None):
+    """Показывает календарь выбора даты ВЫЛЕТА."""
+    today = _date.today()
+    year  = year  or today.year
+    month = month or today.month
+    kb    = build_calendar(year, month, "cf")
+    text  = "📅 *Выберите дату вылета:*"
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await target.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+async def _show_cal_to(query, ctx, year=None, month=None):
+    """Показывает календарь выбора КОНЦА периода поиска."""
+    d_from = ctx.user_data.get("date_from", "")
+    today  = _date.today()
+    year   = year  or today.year
+    month  = month or today.month
+    kb     = build_calendar(year, month, "ct")
+    await query.edit_message_text(
+        f"📅 Вылет: *{d_from}*\n\n"
+        "По какой дате искать? (можно ту же — для точного дня):",
+        reply_markup=kb, parse_mode="Markdown",
+    )
+
+
+async def cb_cal_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия на календарь выбора даты вылета."""
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "ign":
+        return DATES
+
+    if data.startswith("cf_n:"):            # навигация по месяцу
+        _, ym = data.split("cf_n:", 1)
+        y, m = map(int, ym.split(":"))
+        await _show_cal_from(q, ctx, y, m)
+        return DATES
+
+    # Выбор дня (cf_d: или cf_q:)
+    if data.startswith("cf_d:") or data.startswith("cf_q:"):
+        iso = data.split(":", 1)[1]
+        ctx.user_data["date_from"] = _iso_to_display(iso)
+        d = _date.fromisoformat(iso)
+        await _show_cal_to(q, ctx, d.year, d.month)
+        return DATES
+
+    return DATES
+
+
+async def cb_cal_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия на календарь конца периода."""
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "ign":
+        return DATES
+
+    if data.startswith("ct_n:"):            # навигация по месяцу
+        _, ym = data.split("ct_n:", 1)
+        y, m = map(int, ym.split(":"))
+        await _show_cal_to(q, ctx, y, m)
+        return DATES
+
+    # Выбор дня (ct_d: или ct_q:)
+    if data.startswith("ct_d:") or data.startswith("ct_q:"):
+        iso = data.split(":", 1)[1]
+        d_to  = _date.fromisoformat(iso)
+        d_to_str = _iso_to_display(iso)
+        d_from_str = ctx.user_data.get("date_from", "")
+
+        # Если «до» < «от» — snap к «от»
+        try:
+            d_from = datetime.strptime(d_from_str, "%d.%m.%Y").date()
+            if d_to < d_from:
+                d_to = d_from
+                d_to_str = d_from_str
+        except Exception:
+            pass
+
+        ctx.user_data["date_to"] = d_to_str
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 чел.", callback_data="P1"),
+             InlineKeyboardButton("2 чел.", callback_data="P2"),
+             InlineKeyboardButton("3 чел.", callback_data="P3")],
+            [InlineKeyboardButton("4 чел.", callback_data="P4"),
+             InlineKeyboardButton("5 чел.", callback_data="P5")],
+        ])
+        await q.edit_message_text(
+            f"📅 *{d_from_str}* — *{d_to_str}*\n\n👥 Сколько пассажиров?",
+            reply_markup=kb, parse_mode="Markdown",
+        )
+        return PASSENGERS
+
+    return DATES
+
 
 def route_score(price: int, stops: int, layover_hours: float = 0) -> float:
     """
@@ -717,13 +876,8 @@ async def handle_to_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(locs) == 1:
         ctx.user_data["to_code"] = locs[0]["code"]
         ctx.user_data["to_name"] = locs[0]["name"]
-        await msg.edit_text(
-            f"✅ *{locs[0]['name']} ({locs[0]['code']})*\n\n"
-            "📅 Напишите дату вылета или период:\n"
-            "• Один день: `01.07.2026`\n"
-            "• Период: `01.07.2026-10.07.2026`",
-            parse_mode="Markdown",
-        )
+        await msg.edit_text(f"✅ *{locs[0]['name']} ({locs[0]['code']})*", parse_mode="Markdown")
+        await _show_cal_from(update.message, ctx)
         return DATES
 
     ctx.user_data["_locs_to"] = locs
@@ -739,13 +893,8 @@ async def cb_select_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     loc = ctx.user_data["_locs_to"][idx]
     ctx.user_data["to_code"] = loc["code"]
     ctx.user_data["to_name"] = loc["name"]
-    await q.edit_message_text(
-        f"✅ *{loc['name']} ({loc['code']})*\n\n"
-        "📅 Дата вылета или период:\n"
-        "• `01.07.2026`\n"
-        "• `01.07.2026-10.07.2026`",
-        parse_mode="Markdown",
-    )
+    await q.edit_message_text(f"✅ *{loc['name']} ({loc['code']})*", parse_mode="Markdown")
+    await _show_cal_from(q.message, ctx)
     return DATES
 
 
@@ -1075,6 +1224,8 @@ def main():
                 CallbackQueryHandler(cb_select_to, pattern=r"^T\d+$"),
             ],
             DATES: [
+                CallbackQueryHandler(cb_cal_from, pattern=r"^(cf_|ign$)"),
+                CallbackQueryHandler(cb_cal_to,   pattern=r"^(ct_|ign$)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_dates),
             ],
             PASSENGERS: [
