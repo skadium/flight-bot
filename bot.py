@@ -431,10 +431,10 @@ def fmt_price(p: int) -> str:
     return f"{p:,}".replace(",", " ") + " ₽"
 
 
-def fmt_stops(n: int, hub: str = "") -> str:
+def fmt_stops(n: int, hub: str = "", unknown_hub: bool = False) -> str:
     if n == 0:
         return "✅ Прямой рейс"
-    loc = f" в {hub}" if hub else ""
+    loc = f" в {hub}" if hub else (" (город — в ссылке ↗)" if unknown_hub else "")
     if n == 1:
         return f"🔄 1 пересадка{loc}"
     if n == 2:
@@ -491,7 +491,7 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
             if f.get("duration") and f["duration"] != "—":
                 text += f" ({f['duration']})"
             text += "\n"
-            text += f"   {fmt_stops(f['stops'])}\n"
+            text += f"   {fmt_stops(f['stops'], unknown_hub=f['stops'] > 0)}\n"
             if f.get("baggage"):
                 text += f"   {f['baggage']}\n"
             text += f"   🔗 [Купить на {f['source']}]({f['link']})\n\n"
