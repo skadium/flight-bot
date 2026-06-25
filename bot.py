@@ -469,8 +469,8 @@ async def _show_cal_to(query, ctx, year=None, month=None):
     )
 
 
-async def cb_cal_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на календарь выбора даты вылета."""
+async def cb_calendar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Единый обработчик всех нажатий календаря (cf_ и ct_)."""
     q = update.callback_query
     await q.answer()
     data = q.data
@@ -478,13 +478,13 @@ async def cb_cal_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "ign":
         return DATES
 
-    if data.startswith("cf_n:"):            # навигация по месяцу
+    # ── Календарь «от» ──────────────────────────────────────────────────────
+    if data.startswith("cf_n:"):
         _, ym = data.split("cf_n:", 1)
         y, m = map(int, ym.split(":"))
         await _show_cal_from(q, ctx, y, m)
         return DATES
 
-    # Выбор дня (cf_d: или cf_q:)
     if data.startswith("cf_d:") or data.startswith("cf_q:"):
         iso = data.split(":", 1)[1]
         ctx.user_data["date_from"] = _iso_to_display(iso)
@@ -492,28 +492,16 @@ async def cb_cal_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _show_cal_to(q, ctx, d.year, d.month)
         return DATES
 
-    return DATES
-
-
-async def cb_cal_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на календарь конца периода."""
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-
-    if data == "ign":
-        return DATES
-
-    if data.startswith("ct_n:"):            # навигация по месяцу
+    # ── Календарь «до» ──────────────────────────────────────────────────────
+    if data.startswith("ct_n:"):
         _, ym = data.split("ct_n:", 1)
         y, m = map(int, ym.split(":"))
         await _show_cal_to(q, ctx, y, m)
         return DATES
 
-    # Выбор дня (ct_d: или ct_q:)
     if data.startswith("ct_d:") or data.startswith("ct_q:"):
         iso = data.split(":", 1)[1]
-        d_to  = _date.fromisoformat(iso)
+        d_to     = _date.fromisoformat(iso)
         d_to_str = _iso_to_display(iso)
         d_from_str = ctx.user_data.get("date_from", "")
 
@@ -521,7 +509,7 @@ async def cb_cal_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             d_from = datetime.strptime(d_from_str, "%d.%m.%Y").date()
             if d_to < d_from:
-                d_to = d_from
+                d_to     = d_from
                 d_to_str = d_from_str
         except Exception:
             pass
@@ -1224,8 +1212,7 @@ def main():
                 CallbackQueryHandler(cb_select_to, pattern=r"^T\d+$"),
             ],
             DATES: [
-                CallbackQueryHandler(cb_cal_from, pattern=r"^(cf_|ign$)"),
-                CallbackQueryHandler(cb_cal_to,   pattern=r"^(ct_|ign$)"),
+                CallbackQueryHandler(cb_calendar, pattern=r"^(cf_|ct_|ign)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_dates),
             ],
             PASSENGERS: [
