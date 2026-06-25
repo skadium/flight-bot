@@ -380,27 +380,26 @@ def route_score(price: int, stops: int, layover_hours: float = 0) -> float:
     return price + stop_penalty + layover_penalty
 
 
-def layover_warnings(dep_str: str, next_dep_str: str, layover_h: float) -> list[str]:
-    """Возвращает список предупреждений о пересадке."""
-    warnings = []
-    if layover_h >= 6:
-        warnings.append(f"🐢 Долгая пересадка ({layover_h:.0f}ч)")
-    # Ночная пересадка: если транзит захватывает 23:00–05:00
+def layover_warnings(actual_layover_h: float, leg1_h: float = 0, dep_str: str = "") -> list[str]:
+    """Предупреждения о пересадке на основе реального времени ожидания в хабе."""
+    from datetime import timedelta
+    warns = []
+    if actual_layover_h >= 6:
+        warns.append(f"🐢 Долгая пересадка (~{actual_layover_h:.0f}ч в хабе)")
+    # Ночная пересадка: считаем с момента прилёта в хаб
     try:
         fmt = "%d.%m %H:%M"
-        t1 = datetime.strptime(dep_str, fmt)
-        t2 = datetime.strptime(next_dep_str, fmt)
-        # Проверяем каждый час транзита
-        from datetime import timedelta
-        cur = t1
-        while cur < t2:
+        arrive_hub = datetime.strptime(dep_str, fmt) + timedelta(hours=leg1_h)
+        depart_hub = arrive_hub + timedelta(hours=actual_layover_h)
+        cur = arrive_hub
+        while cur < depart_hub:
             if cur.hour >= 23 or cur.hour < 5:
-                warnings.append("🌙 Ночная пересадка")
+                warns.append("🌙 Ночная пересадка")
                 break
             cur += timedelta(hours=1)
     except Exception:
         pass
-    return warnings
+    return warns
 
 
 async def search_via_hub(from_code, hub_code, hub_name, to_code,
@@ -418,28 +417,36 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
     total   = l1["price"] + l2["price"]
     stops   = l1["stops"] + l2["stops"] + 1
 
-    # Время транзита в хабе
-    layover_h = 0.0
+    # Реальное время перелётов по гаверсину (с запасным значением)
+    leg1_h = estimate_flight_hours(from_code, hub_code) or 4.0
+    leg2_h = estimate_flight_hours(hub_code,  to_code)  or 2.0
+
+    # Пытаемся посчитать разницу между вылетами из разных ценовых предложений
+    # ВАЖНО: Aviasales возвращает независимые цены, поэтому это лишь оценка.
+    raw_gap_h = 0.0
     try:
         fmt = "%d.%m %H:%M"
         t1  = datetime.strptime(l1["dep"], fmt)
         t2  = datetime.strptime(l2["dep"], fmt)
-        layover_h = max(0, (t2 - t1).total_seconds() / 3600)
+        raw_gap_h = (t2 - t1).total_seconds() / 3600
     except Exception:
         pass
 
-    warnings = layover_warnings(l1["dep"], l2["dep"], layover_h)
+    # Реальное время ожидания в хабе = разрыв между вылетами - перелёт на leg1.
+    # Если gap <= leg1_h (невозможное соединение или разные даты), берём 3ч по умолчанию.
+    if raw_gap_h > leg1_h + 0.5:
+        actual_layover = raw_gap_h - leg1_h
+    else:
+        actual_layover = 3.0
 
-    # Реальное время в пути по расстоянию между аэропортами
-    leg1_h  = estimate_flight_hours(from_code, hub_code) or 0
-    leg2_h  = estimate_flight_hours(hub_code,  to_code)  or 0
-    total_h = leg1_h + layover_h + leg2_h
+    total_h  = leg1_h + actual_layover + leg2_h
+    warnings = layover_warnings(actual_layover, leg1_h, l1["dep"])
 
     return {
         "source"    : "Aviasales",
         "price"     : total,
         "stops"     : stops,
-        "duration"  : f"~{total_h:.0f}ч" if total_h > 0 else "—",
+        "duration"  : f"~{total_h:.0f}ч",
         "airlines"  : f"{l1['airlines']} + {l2['airlines']}",
         "dep"       : l1["dep"],
         "arr"       : "—",
@@ -450,10 +457,10 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
         "multi_leg" : True,
         "leg1_price": l1["price"],
         "leg2_price": l2["price"],
-        "layover_h" : layover_h,
+        "layover_h" : actual_layover,
         "total_h"   : total_h,
         "warnings"  : warnings,
-        "score"     : route_score(total, stops, layover_h),
+        "score"     : route_score(total, stops, actual_layover),
     }
 
 
