@@ -269,8 +269,24 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
 
                         airline  = f.get("airline", "")
                         fnum     = f.get("flight_number", "")
-                        has_bag  = f.get("has_baggage")
-                        baggage  = ("🧳 с багажом" if has_bag else "🎒 ручная кладь") if has_bag is not None else ""
+
+                        # Время в пути: сначала из поля API (минуты), потом гаверсин
+                        dur_min = f.get("duration", 0) or f.get("duration_to", 0)
+                        if dur_min and int(dur_min) > 0:
+                            h, m = divmod(int(dur_min), 60)
+                            duration = f"{h}ч {m:02d}мин" if m else f"{h}ч"
+                        else:
+                            est = estimate_flight_hours(from_code, to_code)
+                            duration = f"~{est:.0f}ч" if est else "—"
+
+                        # Багаж: проверяем несколько возможных полей API
+                        has_bag = f.get("has_baggage") if f.get("has_baggage") is not None else f.get("bag_included")
+                        if has_bag is True:
+                            baggage = "🧳 с багажом"
+                        elif has_bag is False:
+                            baggage = "🎒 ручная кладь"
+                        else:
+                            baggage = "🎒 без багажа (уточните при бронировании)"
 
                         # Правильная ссылка Aviasales: CODE + DDMM + CODE + passengers
                         link = f"https://www.aviasales.ru/search/{from_code}{dep_date_url}{to_code}{passengers}"
@@ -279,7 +295,7 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
                             "source": "Aviasales",
                             "price": price,
                             "stops": stops,
-                            "duration": "—",
+                            "duration": duration,
                             "airlines": f"{airline} {fnum}".strip() or "—",
                             "dep": dep,
                             "arr": "—",
