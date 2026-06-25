@@ -207,7 +207,6 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
     """Поиск через Aviasales/Travelpayouts (кэшированные дешёвые цены)."""
     url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
 
-    # Парсим диапазон дат пользователя
     try:
         dt_from = datetime.strptime(date_from, "%d.%m.%Y")
         dt_to   = datetime.strptime(date_to,   "%d.%m.%Y")
@@ -222,7 +221,7 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
         "sorting": "price",
         "direct": "true" if max_stops == 0 else "false",
         "currency": "rub",
-        "limit": 20,          # берём больше чтобы было из чего фильтровать
+        "limit": 30,
         "one_way": "true",
         "token": AVIASALES_TOKEN,
     }
@@ -238,11 +237,9 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
                         stops   = f.get("transfers", 0)
                         price   = int(f.get("price", 0))
 
-                        # Фильтр по количеству пересадок
                         if stops > max_stops:
                             continue
 
-                        # Фильтр по датам — только в диапазоне пользователя
                         if dt_from and dt_to:
                             try:
                                 dep_dt = datetime.fromisoformat(dep_raw[:10])
@@ -252,17 +249,21 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
                                 pass
 
                         try:
-                            dep = datetime.fromisoformat(dep_raw.rstrip("Z")).strftime("%d.%m %H:%M")
+                            dep_dt_obj = datetime.fromisoformat(dep_raw.rstrip("Z"))
+                            dep = dep_dt_obj.strftime("%d.%m %H:%M")
+                            # Правильный формат ссылки: DDMM
+                            dep_date_url = dep_dt_obj.strftime("%d%m")
                         except Exception:
                             dep = dep_raw[:10]
+                            dep_date_url = dep_raw[8:10] + dep_raw[5:7]  # fallback
 
-                        airline = f.get("airline", "")
-                        fnum    = f.get("flight_number", "")
-                        dep_date = dep_raw[:10].replace("-", "")
-                        link = (
-                            f"https://www.aviasales.ru/search/"
-                            f"{from_code}{dep_date}{to_code}{passengers}"
-                        )
+                        airline  = f.get("airline", "")
+                        fnum     = f.get("flight_number", "")
+                        has_bag  = f.get("has_baggage")
+                        baggage  = ("🧳 с багажом" if has_bag else "🎒 ручная кладь") if has_bag is not None else ""
+
+                        # Правильная ссылка Aviasales: CODE + DDMM + CODE + passengers
+                        link = f"https://www.aviasales.ru/search/{from_code}{dep_date_url}{to_code}{passengers}"
 
                         results.append({
                             "source": "Aviasales",
@@ -272,9 +273,11 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
                             "airlines": f"{airline} {fnum}".strip() or "—",
                             "dep": dep,
                             "arr": "—",
+                            "baggage": baggage,
                             "link": link,
+                            "multi_leg": False,
                         })
-                        if len(results) >= 4:
+                        if len(results) >= 10:
                             break
                     return results
     except Exception as e:
@@ -283,7 +286,6 @@ async def search_aviasales(from_code, to_code, date_from, date_to, passengers, m
 
 
 def trip_link(from_code, to_code, date_from, passengers) -> str:
-    """Формирует ссылку на Trip.com для поиска."""
     try:
         ds = datetime.strptime(date_from, "%d.%m.%Y").strftime("%Y%m%d")
     except Exception:
@@ -294,8 +296,54 @@ def trip_link(from_code, to_code, date_from, passengers) -> str:
     )
 
 
+# ─── Хабы для поиска составных маршрутов ────────────────────────────────────
+SMART_HUBS = [
+    ("ALA", "Алматы"),
+    ("TAS", "Ташкент"),
+    ("IST", "Стамбул"),
+    ("DXB", "Дубай"),
+    ("BKK", "Бангкок"),
+    ("SVO", "Москва"),
+    ("LED", "Питер"),
+    ("SVX", "Екатеринбург"),
+    ("NSK", "Новосибирск"),
+    ("HKG", "Гонконг"),
+    ("KUL", "Куала-Лумпур"),
+]
+
+
+async def search_via_hub(from_code, hub_code, hub_name, to_code,
+                         date_from, date_to, passengers) -> dict | None:
+    """Ищет маршрут из A через хаб H в B и суммирует цены."""
+    leg1, leg2 = await asyncio.gather(
+        search_aviasales(from_code, hub_code, date_from, date_to, passengers, 1),
+        search_aviasales(hub_code,  to_code,  date_from, date_to, passengers, 1),
+        return_exceptions=True,
+    )
+    if not (isinstance(leg1, list) and leg1 and isinstance(leg2, list) and leg2):
+        return None
+
+    total = leg1[0]["price"] + leg2[0]["price"]
+    return {
+        "source": f"через {hub_name}",
+        "price": total,
+        "stops": leg1[0]["stops"] + leg2[0]["stops"] + 1,
+        "duration": "—",
+        "airlines": f"{leg1[0]['airlines']} → {leg2[0]['airlines']}",
+        "dep": leg1[0]["dep"],
+        "arr": leg2[0]["dep"],
+        "baggage": "",
+        "link": leg1[0]["link"],
+        "link2": leg2[0]["link"],
+        "hub": hub_name,
+        "multi_leg": True,
+        "leg1_price": leg1[0]["price"],
+        "leg2_price": leg2[0]["price"],
+    }
+
+
 async def search_all(from_code, to_code, date_from, date_to, passengers, max_stops) -> list:
-    """Запускает поиск во всех источниках параллельно."""
+    """Ищет прямые/с пересадками + умный поиск через хабы."""
     kiwi_task = search_kiwi(from_code, to_code, date_from, date_to, passengers, max_stops)
     avia_task = search_aviasales(from_code, to_code, date_from, date_to, passengers, max_stops)
 
@@ -307,7 +355,19 @@ async def search_all(from_code, to_code, date_from, date_to, passengers, max_sto
     if isinstance(avia_res, list):
         combined.extend(avia_res)
 
-    # Убираем дубли по цене+авиакомпании, сортируем по цене
+    # Умный поиск через хабы параллельно
+    hub_tasks = [
+        search_via_hub(from_code, hub_code, hub_name, to_code,
+                       date_from, date_to, passengers)
+        for hub_code, hub_name in SMART_HUBS
+        if hub_code not in (from_code, to_code)
+    ]
+    hub_results = await asyncio.gather(*hub_tasks, return_exceptions=True)
+    for r in hub_results:
+        if isinstance(r, dict) and r:
+            combined.append(r)
+
+    # Дедупликация и сортировка по цене
     seen = set()
     unique = []
     for f in sorted(combined, key=lambda x: x["price"]):
@@ -316,7 +376,7 @@ async def search_all(from_code, to_code, date_from, date_to, passengers, max_sto
             seen.add(key)
             unique.append(f)
 
-    return unique[:8]
+    return unique[:10]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -342,27 +402,41 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
             "Попробуйте:\n"
             "• другие даты\n"
             "• разрешить пересадки\n"
-            "• ближайший крупный аэропорт"
+            "• более широкий диапазон дат"
         )
 
     text = f"✈️ *{from_name} → {to_name}*\n"
-    text += f"Найдено {len(results)} вариантов — показываю лучшие:\n\n"
+    text += f"Найдено {len(results)} вариантов — от дешёвого к дорогому:\n\n"
 
-    for i, f in enumerate(results[:5], 1):
-        text += f"*{i}. {fmt_price(f['price'])}*"
-        if i == 1:
-            text += " 🏆"
-        text += "\n"
-        text += f"   ✈️ {f['airlines']}\n"
-        text += f"   🕐 {f['dep']} → {f['arr']}"
-        if f["duration"] != "—":
-            text += f" ({f['duration']})"
-        text += "\n"
-        text += f"   {fmt_stops(f['stops'])}\n"
-        text += f"   🔗 [{f['source']}]({f['link']})\n\n"
+    for i, f in enumerate(results[:10], 1):
+        medal = " 🏆" if i == 1 else ""
+        text += f"*{i}. {fmt_price(f['price'])}*{medal}\n"
 
-    text += f"🌏 [Trip.com — поискать ещё]({tlink})\n\n"
-    text += "💡 _Цены кликабельны — ведут прямо на страницу бронирования._"
+        if f.get("multi_leg"):
+            # Составной маршрут через хаб
+            text += f"   🗺 Маршрут через {f['hub']}\n"
+            text += f"   ✈️ {f['airlines']}\n"
+            text += f"   🕐 Вылет: {f['dep']}\n"
+            text += f"   {fmt_stops(f['stops'])}\n"
+            l1_price = fmt_price(f.get('leg1_price', 0))
+            l2_price = fmt_price(f.get('leg2_price', 0))
+            text += f"   💰 {l1_price} + {l2_price}\n"
+            text += f"   🔗 [Плечо 1]({f['link']})  •  [Плечо 2]({f.get('link2', f['link'])})\n\n"
+        else:
+            text += f"   ✈️ {f['airlines']}\n"
+            text += f"   🕐 {f['dep']}"
+            if f.get("arr") and f["arr"] != "—":
+                text += f" → {f['arr']}"
+            if f.get("duration") and f["duration"] != "—":
+                text += f" ({f['duration']})"
+            text += "\n"
+            text += f"   {fmt_stops(f['stops'])}\n"
+            if f.get("baggage"):
+                text += f"   {f['baggage']}\n"
+            text += f"   🔗 [{f['source']}]({f['link']})\n\n"
+
+    text += f"🌏 [Trip.com — поискать ещё]({tlink})\n"
+    text += "💡 _Кликай на ссылки — откроется страница бронирования._"
     return text
 
 
