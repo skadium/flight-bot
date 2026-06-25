@@ -396,13 +396,6 @@ def build_calendar(year: int, month: int, prefix: str) -> InlineKeyboardMarkup:
 
     rows: list[list[InlineKeyboardButton]] = []
 
-    # Быстрые кнопки
-    quick = []
-    for label, delta in [("Завтра", 1), ("+7д", 7), ("+14д", 14), ("+30д", 30)]:
-        d = today + _td(days=delta)
-        quick.append(InlineKeyboardButton(label, callback_data=f"{prefix}_q:{d.isoformat()}"))
-    rows.append(quick)
-
     # Навигация: ← Месяц Год →
     prev_m, prev_y = (month - 1, year) if month > 1 else (12, year - 1)
     next_m, next_y = (month + 1, year) if month < 12 else (1, year + 1)
