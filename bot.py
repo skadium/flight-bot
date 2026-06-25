@@ -306,6 +306,53 @@ def trip_link(from_code, to_code, date_from, passengers) -> str:
     )
 
 
+# ─── Координаты аэропортов для расчёта времени перелёта ─────────────────────
+from math import radians, sin, cos, sqrt, atan2
+
+AIRPORT_COORDS: dict[str, tuple[float, float]] = {
+    # Россия
+    "NSK": (54.97, 82.91), "BAX": (53.35, 83.54), "SVX": (56.74, 60.80),
+    "SVO": (55.97, 37.41), "DME": (55.41, 37.90), "LED": (59.80, 30.26),
+    "OVB": (54.97, 82.91), "TOF": (56.38, 84.96), "KJA": (56.17, 92.49),
+    "IKT": (52.27, 104.39), "VVO": (43.40, 132.15),
+    # СНГ
+    "ALA": (43.35, 77.04), "TAS": (41.26, 69.28), "FRU": (43.06, 74.48),
+    "EVN": (40.15, 44.40), "TBS": (41.67, 44.95),
+    # Азия
+    "BKK": (13.69, 100.75), "DMK": (13.91, 100.61),
+    "KUL": (2.74, 101.71),  "SIN": (1.36, 103.99),
+    "HKG": (22.31, 113.92), "CAN": (23.39, 113.30),
+    "NGB": (29.83, 121.46), "PVG": (31.14, 121.80),
+    "DAD": (16.04, 108.20), "DAN": (16.04, 108.20),  # Дананг
+    "HAN": (21.22, 105.80), "SGN": (10.82, 106.66),
+    "CNX": (18.77, 98.96),  "HKT": (8.11, 98.31),
+    "MNL": (14.51, 121.02), "CGK": (-6.13, 106.65),
+    "DPS": (-8.75, 115.17),
+    # Ближний Восток / Европа
+    "DXB": (25.25, 55.36),  "AUH": (24.43, 54.65),
+    "IST": (41.28, 28.75),  "SAW": (40.90, 29.31),
+    "DOH": (25.27, 51.61),
+}
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+
+
+def estimate_flight_hours(from_code: str, to_code: str) -> float | None:
+    """Оценивает время перелёта по расстоянию (скорость ~850 км/ч + 1ч наземное)."""
+    c1 = AIRPORT_COORDS.get(from_code)
+    c2 = AIRPORT_COORDS.get(to_code)
+    if not c1 or not c2:
+        return None
+    dist = _haversine_km(c1[0], c1[1], c2[0], c2[1])
+    return round(dist / 850 + 1.0, 1)
+
+
 # ─── Хабы для поиска составных маршрутов ────────────────────────────────────
 SMART_HUBS = [
     ("ALA", "Алматы"),
@@ -383,11 +430,16 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
 
     warnings = layover_warnings(l1["dep"], l2["dep"], layover_h)
 
+    # Реальное время в пути по расстоянию между аэропортами
+    leg1_h  = estimate_flight_hours(from_code, hub_code) or 0
+    leg2_h  = estimate_flight_hours(hub_code,  to_code)  or 0
+    total_h = leg1_h + layover_h + leg2_h
+
     return {
         "source"    : "Aviasales",
         "price"     : total,
         "stops"     : stops,
-        "duration"  : "—",
+        "duration"  : f"~{total_h:.0f}ч" if total_h > 0 else "—",
         "airlines"  : f"{l1['airlines']} + {l2['airlines']}",
         "dep"       : l1["dep"],
         "arr"       : "—",
@@ -399,6 +451,7 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
         "leg1_price": l1["price"],
         "leg2_price": l2["price"],
         "layover_h" : layover_h,
+        "total_h"   : total_h,
         "warnings"  : warnings,
         "score"     : route_score(total, stops, layover_h),
     }
@@ -505,13 +558,11 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
             lh = f.get("layover_h", 0)
             if lh > 0:
                 text += f"   ⏱ Пересадка в {hub}: ~{lh:.0f}ч\n"
-            # Предупреждения
             for w in f.get("warnings", []):
                 text += f"   {w}\n"
-            # Общее время (приблизительно по разнице вылетов)
-            if lh > 0:
-                approx_total = lh + 3  # +3ч на среднее время перелётов
-                text += f"   🕰 Время в пути: ~{approx_total:.0f}ч (примерно)\n"
+            th = f.get("total_h", 0)
+            if th > 0:
+                text += f"   🕰 Время в пути: ~{th:.0f}ч\n"
             l1p = fmt_price(f.get("leg1_price", 0))
             l2p = fmt_price(f.get("leg2_price", 0))
             text += f"   💰 {l1p} + {l2p}\n"
@@ -524,7 +575,9 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
             if f.get("duration") and f["duration"] != "—":
                 text += f" ({f['duration']})"
             text += "\n"
-            text += f"   {fmt_stops(f['stops'], unknown_hub=f['stops'] > 0)}\n"
+            text += f"   {fmt_stops(f['stops'])}\n"
+            if f['stops'] > 0:
+                text += f"   🗺 Маршрут пересадок — на сайте по ссылке\n"
             if f.get("baggage"):
                 text += f"   {f['baggage']}\n"
             text += f"   🔗 [Купить на {f['source']}]({f['link']})\n\n"
