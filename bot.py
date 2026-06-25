@@ -804,8 +804,14 @@ async def handle_menu_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await cmd_help(update, ctx)
 
 
+_MENU_TEXTS = {"🔍 Найти билеты", "🔔 Мои подписки", "❓ Помощь"}
+
+
 async def handle_from_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
+    if query in _MENU_TEXTS:
+        await handle_menu_buttons(update, ctx)
+        return ConversationHandler.END
     msg = await update.message.reply_text("🔎 Ищу аэропорт...")
     locs = await find_location(query)
 
@@ -847,6 +853,9 @@ async def cb_select_from(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_to_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
+    if query in _MENU_TEXTS:
+        await handle_menu_buttons(update, ctx)
+        return ConversationHandler.END
     msg = await update.message.reply_text("🔎 Ищу аэропорт...")
     locs = await find_location(query)
 
@@ -881,6 +890,9 @@ async def cb_select_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_dates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    if text in _MENU_TEXTS:
+        await handle_menu_buttons(update, ctx)
+        return ConversationHandler.END
 
     # Попытка разобрать период DD.MM.YYYY-DD.MM.YYYY
     if "-" in text:
