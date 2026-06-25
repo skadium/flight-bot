@@ -5,7 +5,7 @@ import aiohttp
 import aiosqlite
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +34,16 @@ logger = logging.getLogger(__name__)
 
 # ─── Состояния диалога ───────────────────────────────────────────────────────
 FROM_CITY, TO_CITY, DATES, PASSENGERS, LUGGAGE, STOPS = range(6)
+
+# ─── Постоянная клавиатура ───────────────────────────────────────────────────
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🔍 Найти билеты"), KeyboardButton("🔔 Мои подписки")],
+        [KeyboardButton("❓ Помощь")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # БАЗА ДАННЫХ
@@ -498,31 +508,26 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✈️ *Привет! Я ищу дешёвые авиабилеты по всему миру.*\n\n"
-        "Проверяю сразу три источника:\n"
-        "• 🌍 Kiwi.com — весь мир, бюджетные авиакомпании\n"
-        "• 🇷🇺 Aviasales — СНГ и международные рейсы\n"
-        "• 🌏 Trip.com — особенно хорош для Азии\n\n"
-        "Что умею:\n"
-        "🔍 /search — найти билеты\n"
-        "🔔 /myroutes — мои подписки\n"
-        "❓ /help — помощь\n\n"
-        "Начнём? Жми /search 👇",
+        "Ищу оптимальные маршруты через 11 хабов:\n"
+        "Алматы, Ташкент, Дубай, Стамбул, Бангкок и другие\n\n"
+        "Нажми *«🔍 Найти билеты»* и начнём 👇",
         parse_mode="Markdown",
+        reply_markup=MAIN_KB,
     )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🆘 *Как пользоваться ботом*\n\n"
-        "1. Нажми /search\n"
-        "2. Я спрошу: *откуда → куда → даты → пассажиры → пересадки*\n"
-        "3. Ищу во всех источниках и показываю лучшие цены\n"
-        "4. Нажми «Подписаться» — я буду мониторить цену каждые 2 часа\n"
-        "   и пришлю уведомление если цена упадёт 📉\n\n"
-        "📌 Города можно писать *на русском или английском*\n"
-        "📌 Даты в формате: `01.07.2026` или период `01.07.2026-10.07.2026`\n\n"
-        "Управление подписками: /myroutes",
+        "1. Нажми *«🔍 Найти билеты»*\n"
+        "2. Напиши откуда и куда летишь\n"
+        "3. Укажи даты и количество пассажиров\n"
+        "4. Бот найдёт до 10 маршрутов — прямые и через хабы\n"
+        "5. Нажми *«Следить за ценой»* — бот пришлёт уведомление когда подешевеет 📉\n\n"
+        "📌 Города на русском или английском\n"
+        "📌 Даты: `01.07.2026` или диапазон `01.07.2026-10.07.2026`",
         parse_mode="Markdown",
+        reply_markup=MAIN_KB,
     )
 
 
@@ -537,6 +542,17 @@ async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
     return FROM_CITY
+
+
+async def handle_menu_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия кнопок постоянного меню."""
+    text = update.message.text
+    if text == "🔍 Найти билеты":
+        return await cmd_search(update, ctx)
+    elif text == "🔔 Мои подписки":
+        return await cmd_myroutes(update, ctx)
+    elif text == "❓ Помощь":
+        return await cmd_help(update, ctx)
 
 
 async def handle_from_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -938,6 +954,7 @@ def main():
         entry_points=[
             CommandHandler("search", cmd_search),
             CallbackQueryHandler(cb_new_search, pattern="^NEW_SEARCH$"),
+            MessageHandler(filters.Regex("^🔍 Найти билеты$"), cmd_search),
         ],
         states={
             FROM_CITY: [
@@ -962,10 +979,15 @@ def main():
         allow_reentry=True,
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CommandHandler("myroutes", cmd_myroutes))
     app.add_handler(conv)
+    # Кнопки постоянного меню
+    app.add_handler(MessageHandler(
+        filters.Regex("^(🔔 Мои подписки|❓ Помощь)$"),
+        handle_menu_buttons,
+    ))
     app.add_handler(CallbackQueryHandler(cb_subscribe,   pattern="^DO_SUBSCRIBE$"))
     app.add_handler(CallbackQueryHandler(cb_unsubscribe, pattern=r"^UNSUB_\d+$"))
 
