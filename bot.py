@@ -312,9 +312,20 @@ SMART_HUBS = [
 ]
 
 
+def route_score(price: int, stops: int, layover_hours: float = 0) -> float:
+    """
+    Оптимальность маршрута (меньше = лучше).
+    Каждая пересадка = штраф 5 000 ₽.
+    Каждый час транзита сверх 1 часа = штраф 400 ₽.
+    """
+    stop_penalty    = stops * 5_000
+    layover_penalty = max(0, layover_hours - 1) * 400
+    return price + stop_penalty + layover_penalty
+
+
 async def search_via_hub(from_code, hub_code, hub_name, to_code,
                          date_from, date_to, passengers) -> dict | None:
-    """Ищет маршрут из A через хаб H в B и суммирует цены."""
+    """Строит маршрут A → HUB → B, считает суммарную стоимость и оценку."""
     leg1, leg2 = await asyncio.gather(
         search_aviasales(from_code, hub_code, date_from, date_to, passengers, 1),
         search_aviasales(hub_code,  to_code,  date_from, date_to, passengers, 1),
@@ -323,27 +334,43 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
     if not (isinstance(leg1, list) and leg1 and isinstance(leg2, list) and leg2):
         return None
 
-    total = leg1[0]["price"] + leg2[0]["price"]
+    l1, l2   = leg1[0], leg2[0]
+    total    = l1["price"] + l2["price"]
+    stops    = l1["stops"] + l2["stops"] + 1  # +1 за пересадку в хабе
+
+    # Оцениваем время транзита в хабе по разнице дат вылета
+    layover_h = 0.0
+    try:
+        fmt = "%d.%m %H:%M"
+        t1  = datetime.strptime(l1["dep"], fmt)
+        t2  = datetime.strptime(l2["dep"], fmt)
+        layover_h = max(0, (t2 - t1).total_seconds() / 3600)
+    except Exception:
+        pass
+
     return {
-        "source": f"через {hub_name}",
-        "price": total,
-        "stops": leg1[0]["stops"] + leg2[0]["stops"] + 1,
-        "duration": "—",
-        "airlines": f"{leg1[0]['airlines']} → {leg2[0]['airlines']}",
-        "dep": leg1[0]["dep"],
-        "arr": leg2[0]["dep"],
-        "baggage": "",
-        "link": leg1[0]["link"],
-        "link2": leg2[0]["link"],
-        "hub": hub_name,
-        "multi_leg": True,
-        "leg1_price": leg1[0]["price"],
-        "leg2_price": leg2[0]["price"],
+        "source"    : "Aviasales",
+        "price"     : total,
+        "stops"     : stops,
+        "duration"  : "—",
+        "airlines"  : f"{l1['airlines']} + {l2['airlines']}",
+        "dep"       : l1["dep"],
+        "arr"       : "—",
+        "baggage"   : "",
+        "link"      : l1["link"],
+        "link2"     : l2["link"],
+        "hub"       : hub_name,
+        "multi_leg" : True,
+        "leg1_price": l1["price"],
+        "leg2_price": l2["price"],
+        "layover_h" : layover_h,
+        "score"     : route_score(total, stops, layover_h),
     }
 
 
 async def search_all(from_code, to_code, date_from, date_to, passengers, max_stops) -> list:
-    """Ищет прямые/с пересадками + умный поиск через хабы."""
+    """Ищет прямые + с пересадками + составные маршруты. Сортирует по оптимальности."""
+    # Прямой поиск
     kiwi_task = search_kiwi(from_code, to_code, date_from, date_to, passengers, max_stops)
     avia_task = search_aviasales(from_code, to_code, date_from, date_to, passengers, max_stops)
 
@@ -351,11 +378,17 @@ async def search_all(from_code, to_code, date_from, date_to, passengers, max_sto
 
     combined = []
     if isinstance(kiwi_res, list):
-        combined.extend(kiwi_res)
+        for f in kiwi_res:
+            f.setdefault("score", route_score(f["price"], f["stops"]))
+            f.setdefault("multi_leg", False)
+            combined.append(f)
     if isinstance(avia_res, list):
-        combined.extend(avia_res)
+        for f in avia_res:
+            f.setdefault("score", route_score(f["price"], f["stops"]))
+            f.setdefault("multi_leg", False)
+            combined.append(f)
 
-    # Умный поиск через хабы параллельно
+    # Умный поиск через хабы — параллельно
     hub_tasks = [
         search_via_hub(from_code, hub_code, hub_name, to_code,
                        date_from, date_to, passengers)
@@ -367,15 +400,16 @@ async def search_all(from_code, to_code, date_from, date_to, passengers, max_sto
         if isinstance(r, dict) and r:
             combined.append(r)
 
-    # Дедупликация и сортировка по цене
-    seen = set()
-    unique = []
-    for f in sorted(combined, key=lambda x: x["price"]):
+    # Дедупликация по (цена, авиакомпания)
+    seen, unique = set(), []
+    for f in combined:
         key = (f["price"], f["airlines"])
         if key not in seen:
             seen.add(key)
             unique.append(f)
 
+    # Сортируем по score (оптимальность), затем по цене
+    unique.sort(key=lambda x: (x.get("score", x["price"]), x["price"]))
     return unique[:10]
 
 
@@ -387,12 +421,15 @@ def fmt_price(p: int) -> str:
     return f"{p:,}".replace(",", " ") + " ₽"
 
 
-def fmt_stops(n: int) -> str:
+def fmt_stops(n: int, hub: str = "") -> str:
     if n == 0:
-        return "✅ Прямой"
+        return "✅ Прямой рейс"
+    loc = f" в {hub}" if hub else ""
     if n == 1:
-        return "🔄 1 пересадка"
-    return f"🔄 {n} пересадки"
+        return f"🔄 1 пересадка{loc}"
+    if n == 2:
+        return f"🔄 2 пересадки{loc}"
+    return f"🔄 {n} пересадок{loc}"
 
 
 def build_results_text(results, from_name, to_name, tlink) -> str:
@@ -400,28 +437,42 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
         return (
             "😔 *Ничего не найдено*\n\n"
             "Попробуйте:\n"
-            "• другие даты\n"
-            "• разрешить пересадки\n"
-            "• более широкий диапазон дат"
+            "• другие даты или более широкий диапазон\n"
+            "• разрешить пересадки"
         )
 
     text = f"✈️ *{from_name} → {to_name}*\n"
-    text += f"Найдено {len(results)} вариантов — от дешёвого к дорогому:\n\n"
+    text += f"Найдено {len(results)} вариантов — лучшие по цене и удобству:\n\n"
 
     for i, f in enumerate(results[:10], 1):
-        medal = " 🏆" if i == 1 else ""
-        text += f"*{i}. {fmt_price(f['price'])}*{medal}\n"
+        if i == 1:
+            badge = " 🏆 _оптимальный_"
+        elif f.get("stops", 99) == 0:
+            badge = " ⚡ _прямой_"
+        elif i <= 3:
+            badge = " 💰"
+        else:
+            badge = ""
+
+        text += f"*{i}. {fmt_price(f['price'])}*{badge}\n"
 
         if f.get("multi_leg"):
-            # Составной маршрут через хаб
-            text += f"   🗺 Маршрут через {f['hub']}\n"
-            text += f"   ✈️ {f['airlines']}\n"
+            hub = f.get("hub", "")
+            text += f"   🗺 {from_name} → *{hub}* → {to_name}\n"
+            airlines = f['airlines'].split(' + ')
+            if len(airlines) == 2:
+                text += f"   ✈️ {airlines[0].strip()}  →  {airlines[1].strip()}\n"
+            else:
+                text += f"   ✈️ {f['airlines']}\n"
             text += f"   🕐 Вылет: {f['dep']}\n"
-            text += f"   {fmt_stops(f['stops'])}\n"
-            l1_price = fmt_price(f.get('leg1_price', 0))
-            l2_price = fmt_price(f.get('leg2_price', 0))
-            text += f"   💰 {l1_price} + {l2_price}\n"
-            text += f"   🔗 [Плечо 1]({f['link']})  •  [Плечо 2]({f.get('link2', f['link'])})\n\n"
+            text += f"   {fmt_stops(f['stops'], hub)}\n"
+            lh = f.get("layover_h", 0)
+            if lh > 0:
+                text += f"   ⏱ Транзит в {hub}: ~{lh:.0f}ч\n"
+            l1 = fmt_price(f.get("leg1_price", 0))
+            l2 = fmt_price(f.get("leg2_price", 0))
+            text += f"   💰 {l1} + {l2}\n"
+            text += f"   🔗 [Плечо 1 →]({f['link']})  [Плечо 2 →]({f.get('link2', f['link'])})\n\n"
         else:
             text += f"   ✈️ {f['airlines']}\n"
             text += f"   🕐 {f['dep']}"
@@ -433,10 +484,10 @@ def build_results_text(results, from_name, to_name, tlink) -> str:
             text += f"   {fmt_stops(f['stops'])}\n"
             if f.get("baggage"):
                 text += f"   {f['baggage']}\n"
-            text += f"   🔗 [{f['source']}]({f['link']})\n\n"
+            text += f"   🔗 [Купить на {f['source']}]({f['link']})\n\n"
 
-    text += f"🌏 [Trip.com — поискать ещё]({tlink})\n"
-    text += "💡 _Кликай на ссылки — откроется страница бронирования._"
+    text += f"🌏 [Ещё варианты на Trip.com]({tlink})\n"
+    text += "💡 _Ранжировано по цене + время + пересадки._"
     return text
 
 
