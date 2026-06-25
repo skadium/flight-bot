@@ -434,7 +434,7 @@ def fmt_price(p: int) -> str:
 def fmt_stops(n: int, hub: str = "", unknown_hub: bool = False) -> str:
     if n == 0:
         return "✅ Прямой рейс"
-    loc = f" в {hub}" if hub else (" (город — в ссылке ↗)" if unknown_hub else "")
+    loc = f" в {hub}" if hub else ""
     if n == 1:
         return f"🔄 1 пересадка{loc}"
     if n == 2:
