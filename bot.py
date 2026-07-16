@@ -372,17 +372,30 @@ def estimate_flight_hours(from_code: str, to_code: str) -> float | None:
 
 # ─── Хабы для поиска составных маршрутов ────────────────────────────────────
 SMART_HUBS = [
+    # СНГ и Россия
     ("ALA", "Алматы"),
     ("TAS", "Ташкент"),
-    ("IST", "Стамбул"),
-    ("DXB", "Дубай"),
-    ("BKK", "Бангкок"),
     ("SVO", "Москва"),
     ("LED", "Питер"),
     ("SVX", "Екатеринбург"),
-    ("NSK", "Новосибирск"),
+    # Ближний Восток
+    ("IST", "Стамбул"),
+    ("DXB", "Дубай"),
+    ("AUH", "Абу-Даби"),
+    ("DOH", "Доха"),
+    # Юго-Восточная Азия
+    ("BKK", "Бангкок"),
     ("HKG", "Гонконг"),
     ("KUL", "Куала-Лумпур"),
+    ("SIN", "Сингапур"),
+    ("SGN", "Хошимин"),
+    ("CAN", "Гуанчжоу"),
+    # Восточная Азия
+    ("ICN", "Сеул"),
+    ("PEK", "Пекин"),
+    ("PVG", "Шанхай"),
+    # Другие
+    ("DEL", "Дели"),
 ]
 
 # ─── Инлайн-календарь ────────────────────────────────────────────────────────
@@ -620,13 +633,72 @@ async def search_via_hub(from_code, hub_code, hub_name, to_code,
     }
 
 
+async def discover_hubs_tp(from_code: str, to_code: str) -> list[tuple[str, str]]:
+    """
+    Ищет дополнительные хабы через Travelpayouts API:
+    1. v1/prices/cheap — все дешёвые направления из from_code
+    2. v1/prices/direct — проверяет каждый как промежуточный к to_code
+    Возвращает список (hub_code, hub_name) не входящих в SMART_HUBS.
+    """
+    if not AVIASALES_TOKEN:
+        return []
+
+    static_codes = {h[0] for h in SMART_HUBS}
+    token = AVIASALES_TOKEN
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Шаг 1: дешёвые из origin
+            url = (f"https://api.travelpayouts.com/v1/prices/cheap"
+                   f"?origin={from_code}&destination=&token={token}")
+            async with session.get(url) as r:
+                data = (await r.json()).get("data", {})
+
+            # Только новые хабы (не в SMART_HUBS, не сам origin/dest)
+            candidates = [
+                code for code in data.keys()
+                if code not in static_codes
+                and code not in (from_code, to_code)
+            ][:25]  # не более 25 дополнительных запросов
+
+            if not candidates:
+                return []
+
+            # Шаг 2: параллельная проверка hub → to_code
+            async def check_hub(hub: str) -> str | None:
+                try:
+                    u = (f"https://api.travelpayouts.com/v1/prices/direct"
+                         f"?origin={hub}&destination={to_code}&token={token}")
+                    async with session.get(u, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                        d = (await resp.json()).get("data", {})
+                        if to_code in d and d[to_code]:
+                            return hub
+                except Exception:
+                    pass
+                return None
+
+            results = await asyncio.gather(*[check_hub(h) for h in candidates],
+                                           return_exceptions=True)
+            found = [r for r in results if isinstance(r, str)]
+            logger.info("Динамические хабы %s→%s: %s", from_code, to_code, found)
+            return [(code, code) for code in found]  # имя = код (нет рус. перевода)
+
+    except Exception as e:
+        logger.warning("discover_hubs_tp error: %s", e)
+        return []
+
+
 async def search_all(from_code, to_code, date_from, date_to, passengers, max_stops) -> list:
     """Ищет прямые + с пересадками + составные маршруты. Сортирует по оптимальности."""
-    # Прямой поиск
-    kiwi_task = search_kiwi(from_code, to_code, date_from, date_to, passengers, max_stops)
-    avia_task = search_aviasales(from_code, to_code, date_from, date_to, passengers, max_stops)
+    # Прямой поиск и динамическое обнаружение хабов — параллельно
+    kiwi_task   = search_kiwi(from_code, to_code, date_from, date_to, passengers, max_stops)
+    avia_task   = search_aviasales(from_code, to_code, date_from, date_to, passengers, max_stops)
+    tp_hub_task = discover_hubs_tp(from_code, to_code)
 
-    kiwi_res, avia_res = await asyncio.gather(kiwi_task, avia_task, return_exceptions=True)
+    kiwi_res, avia_res, extra_hubs = await asyncio.gather(
+        kiwi_task, avia_task, tp_hub_task, return_exceptions=True
+    )
 
     combined = []
     if isinstance(kiwi_res, list):
@@ -640,12 +712,21 @@ async def search_all(from_code, to_code, date_from, date_to, passengers, max_sto
             f.setdefault("multi_leg", False)
             combined.append(f)
 
-    # Умный поиск через хабы — параллельно
+    # Объединяем статические + динамические хабы (дедупликация по коду)
+    if not isinstance(extra_hubs, list):
+        extra_hubs = []
+    hub_map = {code: name for code, name in SMART_HUBS}
+    for code, name in extra_hubs:
+        if code not in hub_map:
+            hub_map[code] = name
+    all_hubs = [(code, name) for code, name in hub_map.items()
+                if code not in (from_code, to_code)]
+
+    # Умный поиск через все хабы — параллельно
     hub_tasks = [
         search_via_hub(from_code, hub_code, hub_name, to_code,
                        date_from, date_to, passengers)
-        for hub_code, hub_name in SMART_HUBS
-        if hub_code not in (from_code, to_code)
+        for hub_code, hub_name in all_hubs
     ]
     hub_results = await asyncio.gather(*hub_tasks, return_exceptions=True)
     for r in hub_results:
